@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Env / secrets
+.env
+
+# Locally stored uploaded originals (this is what Step 1 of the file
+# persistence work adds — don't commit users' uploaded documents)
+storage/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
