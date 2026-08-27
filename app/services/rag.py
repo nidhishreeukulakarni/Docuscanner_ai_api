@@ -4,7 +4,7 @@ RAG retrieval + chat generation.
 Pipeline: embed the user's question with the same BGE-large model used
 at ingestion time -> pull the top-k nearest chunks for one document via
 pgvector cosine distance -> stuff them into a prompt with page numbers
--> stream a completion back from Groq (OpenAI-compatible endpoint).
+-> stream a completion back from Gemini (OpenAI-compatible endpoint).
 
 Chat is scoped to a single document_id, matching the split-pane
 workspace (one doc open at a time in the viewer).
@@ -14,18 +14,22 @@ highlighted_text/highlighted_page, skip pgvector retrieval entirely and
 answer from just that passage — see build_scoped_messages below.
 """
 
-import json
 import uuid
 from typing import AsyncGenerator
 
-import httpx
+from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import DocumentChunk
 from app.services.embeddings import embed_chunks
 
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+chat_client = AsyncOpenAI(
+    api_key=settings.google_api_key,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+CHAT_MODEL = "gemini-3.6-flash"  # same model used in summarization.py
 
 SYSTEM_PROMPT = (
     "You are DocuSense AI, an assistant that answers questions about a "
@@ -71,7 +75,7 @@ def build_messages(
     question: str,
     history: list[dict] | None = None,
 ) -> list[dict]:
-    """Assemble the OpenAI-style message list Groq expects."""
+    """Assemble the OpenAI-style message list the chat client expects."""
     if chunks:
         excerpts = "\n\n".join(
             f"[Excerpt from p. {c.page_num}]\n{c.content}" for c in chunks
@@ -123,45 +127,26 @@ def build_scoped_messages(
 
 
 async def stream_answer(messages: list[dict]) -> AsyncGenerator[str, None]:
-    """Yield answer text incrementally from Groq's streaming chat endpoint."""
-    if not settings.groq_api_key:
+    """Yield answer text incrementally from Gemini's streaming chat endpoint."""
+    if not settings.google_api_key:
         yield (
-            "[Setup needed] GROQ_API_KEY is empty in .env. Get a free key "
-            "at console.groq.com and add it, then restart uvicorn."
+            "[Setup needed] GOOGLE_API_KEY is empty in .env. Add your key "
+            "and restart uvicorn."
         )
         return
 
-    payload = {
-        "model": settings.groq_model,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.2,
-    }
-    headers = {
-        "Authorization": f"Bearer {settings.groq_api_key}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream(
-            "POST", GROQ_CHAT_URL, json=payload, headers=headers
-        ) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                yield f"[Groq error {response.status_code}] {body.decode(errors='replace')}"
-                return
-
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[len("data: "):]
-                if data == "[DONE]":
-                    break
-                try:
-                    parsed = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                delta = parsed.get("choices", [{}])[0].get("delta", {})
-                token = delta.get("content")
-                if token:
-                    yield token
+    try:
+        stream = await chat_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            stream=True,
+            temperature=0.2,
+        )
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            token = chunk.choices[0].delta.content
+            if token:
+                yield token
+    except Exception as e:
+        yield f"[Gemini error] {e}"
