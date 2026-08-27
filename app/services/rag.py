@@ -2,14 +2,19 @@
 RAG retrieval + chat generation.
 
 Pipeline: embed the user's question with the same BGE-large model used
-at ingestion time -> pull the top-k nearest chunks for one document via
-pgvector cosine distance -> stuff them into a prompt with page numbers
--> stream a completion back from Gemini (OpenAI-compatible endpoint).
+at ingestion time -> pull the top-k nearest chunks via pgvector cosine
+distance -> stuff them into a prompt with page numbers -> stream a
+completion back from Gemini (OpenAI-compatible endpoint).
 
-Chat is scoped to a single document_id, matching the split-pane
-workspace (one doc open at a time in the viewer).
+Two retrieval scopes are supported:
+  - Single document (retrieve_chunks / build_messages) — the original
+    split-pane workspace flow, one doc open at a time.
+  - Across all of a user's documents (retrieve_chunks_across_documents /
+    build_multi_doc_messages) — Day 2's "ask across all my documents"
+    feature. Citations here include the source document's title, not
+    just its page number, since the answer may draw from several files.
 
-Step 8 (highlight-to-ask) adds a second path: when the frontend sends
+Step 8 (highlight-to-ask) adds a third path: when the frontend sends
 highlighted_text/highlighted_page, skip pgvector retrieval entirely and
 answer from just that passage — see build_scoped_messages below.
 """
@@ -21,7 +26,7 @@ from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import DocumentChunk
+from app.models import Document, DocumentChunk
 from app.services.embeddings import embed_chunks
 
 chat_client = AsyncOpenAI(
@@ -48,6 +53,16 @@ SCOPED_SYSTEM_PROMPT = (
     "plainly instead of guessing."
 )
 
+MULTI_DOC_SYSTEM_PROMPT = (
+    "You are DocuSense AI, an assistant that answers questions across a "
+    "user's entire document library, using only the excerpts provided "
+    "below. Excerpts may come from different documents — every claim "
+    "you make must be grounded in the excerpts, and you must cite which "
+    "document each claim comes from. If the excerpts don't contain the "
+    "answer, say so plainly instead of guessing. When you use an "
+    "excerpt, cite it in the form (\"document title\", p. N)."
+)
+
 
 def embed_query(text: str) -> list[float]:
     """Embed a single query string with the same model used for chunks."""
@@ -64,6 +79,32 @@ def retrieve_chunks(
     return (
         db.query(DocumentChunk)
         .filter(DocumentChunk.doc_id == document_id)
+        .order_by(DocumentChunk.embedding_vector.cosine_distance(query_embedding))
+        .limit(top_k)
+        .all()
+    )
+
+
+def retrieve_chunks_across_documents(
+    db: Session,
+    owner_id: uuid.UUID,
+    query_embedding: list[float],
+    top_k: int = 8,
+) -> list[tuple[DocumentChunk, str]]:
+    """
+    Day 2: top-k chunks across ALL of a user's ready documents, nearest
+    first, by cosine distance — no per-document limit, so one document
+    could dominate the results if it's simply more relevant to the
+    question. Deliberately not doing any per-document quota/reranking
+    here, matching the plan's "no reranking" scope for this pass.
+
+    Returns (chunk, document_title) tuples since the caller needs the
+    title to cite which document each excerpt came from.
+    """
+    return (
+        db.query(DocumentChunk, Document.title)
+        .join(Document, DocumentChunk.doc_id == Document.id)
+        .filter(Document.owner_id == owner_id, Document.status == "ready")
         .order_by(DocumentChunk.embedding_vector.cosine_distance(query_embedding))
         .limit(top_k)
         .all()
@@ -115,6 +156,43 @@ def build_scoped_messages(
     context_block = f"Highlighted passage{page_note}:\n\n{highlighted_text}"
 
     messages = [{"role": "system", "content": SCOPED_SYSTEM_PROMPT}]
+
+    for turn in (history or [])[-6:]:
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+
+    messages.append(
+        {"role": "user", "content": f"{context_block}\n\nQuestion: {question}"}
+    )
+    return messages
+
+
+def build_multi_doc_messages(
+    chunks_with_titles: list[tuple[DocumentChunk, str]],
+    question: str,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    """
+    Day 2: message list for a query scoped across all of a user's
+    documents. Each excerpt is labeled with its source document's
+    title (not just its page number) so the model — and the citations
+    the frontend renders — can tell them apart.
+    """
+    if chunks_with_titles:
+        excerpts = "\n\n".join(
+            f'[Excerpt from "{title}", p. {c.page_num}]\n{c.content}'
+            for c, title in chunks_with_titles
+        )
+        context_block = (
+            f"Document excerpts (from across your uploaded documents):\n\n{excerpts}"
+        )
+    else:
+        context_block = (
+            "No excerpts were retrieved from your documents — "
+            "you may not have any ready documents yet."
+        )
+
+    messages = [{"role": "system", "content": MULTI_DOC_SYSTEM_PROMPT}]
 
     for turn in (history or [])[-6:]:
         if turn.get("role") in ("user", "assistant") and turn.get("content"):

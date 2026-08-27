@@ -40,10 +40,15 @@ class ChatMessage(Base):
     exchange — one role="user", one role="assistant" — so a thread can
     be replayed in order via ORDER BY created_at. citations_json mirrors
     the same {chunk_id, page_num, bbox} shape chat.py already streams
-    to the frontend, so history + live chat render identically."""
+    to the frontend, so history + live chat render identically.
+
+    doc_id is nullable: a normal single-document chat turn has doc_id
+    set to that document's id, but a multi-document ("ask across all my
+    documents") turn has doc_id = NULL and is scoped by user_id only —
+    see routers/chat_all.py."""
     __tablename__ = "chat_messages"
     msg_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    doc_id = Column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False, index=True)
+    doc_id = Column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True, index=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     role = Column(String, nullable=False)  # "user" | "assistant"
     content = Column(Text, nullable=False)
