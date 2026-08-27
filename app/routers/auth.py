@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
@@ -72,6 +73,10 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email).first()
     if user is None or not verify_password(body.password, user.hashed_password):
         raise HTTPException(401, "Incorrect email or password")
+
+    user.last_login = datetime.utcnow()
+    user.login_count = (user.login_count or 0) + 1
+    db.commit()
 
     token = create_access_token(user.id)
     return TokenResponse(access_token=token, user_id=str(user.id), email=user.email)

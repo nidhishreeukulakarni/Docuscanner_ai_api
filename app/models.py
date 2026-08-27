@@ -12,6 +12,8 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    last_login = Column(DateTime, nullable=True)
+    login_count = Column(Integer, default=0, nullable=False)
 
 class Document(Base):
     __tablename__ = "documents"
