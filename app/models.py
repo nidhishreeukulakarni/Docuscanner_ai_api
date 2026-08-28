@@ -25,6 +25,14 @@ class Document(Base):
     page_count = Column(Integer)
     status = Column(String, default="processing")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # Cache fields: avoids re-calling the LLM (and burning rate-limit
+    # quota) every time a user opens the Summary tab for a document
+    # that's already been summarized. NULL until the first successful
+    # summary; summary_router.py checks this before calling
+    # stream_summary(), and only bypasses it when the client explicitly
+    # requests force=true (the "Regenerate summary" button).
+    summary_json = Column(JSONB, nullable=True)
+    summary_generated_at = Column(DateTime, nullable=True)
 
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
